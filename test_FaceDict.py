@@ -12,6 +12,8 @@ import torch
 import random
 import cv2
 import dlib
+import time
+from multiprocessing import Pool
 from skimage import transform as trans
 from skimage import io
 from data.image_folder import make_dataset
@@ -27,8 +29,8 @@ def get_5_points(img):
     if len(dets) == 0:
         return None
     areas = []
-    if len(dets) > 1:
-        print('\t###### Warning: more than one face is detected. In this version, we only handle the largest one.')
+    # if len(dets) > 1:
+    #     print('\t###### Warning: more than one face is detected. In this version, we only handle the largest one.')
     for i in range(len(dets)):
         area = (dets[i].rect.right()-dets[i].rect.left())*(dets[i].rect.bottom()-dets[i].rect.top())
         areas.append(area)
@@ -39,7 +41,12 @@ def get_5_points(img):
         single_points.append([shape.part(i).x, shape.part(i).y])
     return np.array(single_points) 
 
-def align_and_save(img_path, save_path, save_input_path, save_param_path, upsample_scale=2):
+def align_and_save(task_params):
+    img_path, save_path, save_input_path, save_param_path, upsample_scale = task_params
+
+
+    print('Crop and Align {} image'.format(os.path.basename(img_path)))
+
     out_size = (512, 512) 
     img = dlib.load_rgb_image(img_path)
     h,w,_ = img.shape
@@ -58,7 +65,8 @@ def align_and_save(img_path, save_path, save_input_path, save_param_path, upsamp
     # inv_M = cv2.invertAffineTransform(M)
     np.savetxt(save_param_path, tform2.params[0:2,:],fmt='%.3f') #save the inverse affine parameters
     
-def reverse_align(input_path, face_path, param_path, save_path, upsample_scale=2):
+def reverse_align(params):
+    input_path, face_path, param_path, save_path, upsample_scale = params
     out_size = (512, 512) 
     input_img = dlib.load_rgb_image(input_path)
     h,w,_ = input_img.shape
@@ -143,6 +151,8 @@ if __name__ == '__main__':
     opt.display_id = -1  # no visdom display
     opt.which_epoch = 'latest' #
 
+    n_threads = 4
+
     #######################################################################
     ########################### Test Param ################################
     #######################################################################
@@ -177,15 +187,22 @@ if __name__ == '__main__':
     if not os.path.exists(SaveParamPath):
         os.makedirs(SaveParamPath)
 
+    pool =  Pool(processes=n_threads)
+
+    task_params = []
+
     ImgPaths = make_dataset(TestImgPath)
     for i, ImgPath in enumerate(ImgPaths):
         ImgName = os.path.split(ImgPath)[-1]
-        print('Crop and Align {} image'.format(ImgName))
         SavePath = os.path.join(SaveCropPath,ImgName)
         SaveInput = os.path.join(SaveInputPath,ImgName)
         SaveParam = os.path.join(SaveParamPath, ImgName+'.npy')
-        align_and_save(ImgPath, SavePath, SaveInput, SaveParam, UpScaleWhole)
+        if os.path.exists(SavePath) and os.path.exists(SaveInput) and os.path.exists(SaveParam):
+            continue 
+        task_params.append([ImgPath, SavePath, SaveInput, SaveParam, UpScaleWhole])
 
+    pool.map(align_and_save, task_params) 
+    pool.close()
     #######################################################################
     ####### Step 2: Face Landmark Detection from the Cropped Image ########
     #######################################################################
@@ -204,6 +221,11 @@ if __name__ == '__main__':
     ImgPaths = make_dataset(SaveCropPath)
     for i,ImgPath in enumerate(ImgPaths):
         ImgName = os.path.split(ImgPath)[-1]
+        SaveName = ImgName+'.txt'
+
+        if os.path.exists(os.path.join(SaveLandmarkPath,SaveName)):
+            continue
+
         print('Detecting {}'.format(ImgName))
         Img = io.imread(ImgPath)
         try:
@@ -224,7 +246,6 @@ if __name__ == '__main__':
             # continue
         preds = PredsAll[ins]
         AddLength = np.sqrt(np.sum(np.power(preds[27][0:2]-preds[33][0:2],2)))
-        SaveName = ImgName+'.txt'
         np.savetxt(os.path.join(SaveLandmarkPath,SaveName),preds[:,0:2],fmt='%.3f')
 
     #######################################################################
@@ -245,6 +266,9 @@ if __name__ == '__main__':
     total = 0
     for i, ImgPath in enumerate(ImgPaths):
         ImgName = os.path.split(ImgPath)[-1]
+        if os.path.exists(os.path.join(SaveRestorePath,SaveName)):
+            continue
+        
         print('Restoring {}'.format(ImgName))
         torch.cuda.empty_cache()
         data = obtain_inputs(SaveCropPath, SaveLandmarkPath, ImgName)
@@ -270,10 +294,13 @@ if __name__ == '__main__':
     print('############### Step 4: Paste the Restored Face to the Input Image ############')
     print('###############################################################################\n')
 
+    pool =  Pool(processes=n_threads)
     SaveFianlPath = os.path.join(ResultsDir,'Step4_FinalResults')
     if not os.path.exists(SaveFianlPath):
         os.makedirs(SaveFianlPath)
     ImgPaths = make_dataset(SaveRestorePath)
+
+    step4_task_params = []
     for i,ImgPath in enumerate(ImgPaths):
         ImgName = os.path.split(ImgPath)[-1]
         print('Final Restoring {}'.format(ImgName))
@@ -281,7 +308,9 @@ if __name__ == '__main__':
         FaceResultPath = os.path.join(SaveRestorePath, ImgName)
         ParamPath = os.path.join(SaveParamPath, ImgName+'.npy')
         SaveWholePath = os.path.join(SaveFianlPath, ImgName)
-        reverse_align(WholeInputPath, FaceResultPath, ParamPath, SaveWholePath, UpScaleWhole)
+        step4_task_params.append([WholeInputPath, FaceResultPath, ParamPath, SaveWholePath, UpScaleWhole])
 
+    pool.map(reverse_align, step4_task_params)
+    pool.close()
     print('\nAll results are saved in {} \n'.format(ResultsDir))
     
